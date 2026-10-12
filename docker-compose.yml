@@ -1,0 +1,84 @@
+services:
+  ytube-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ytube-api:latest
+    restart: always
+    # Scale the API horizontally: `docker compose up -d --scale ytube-api=N`.
+    # (No container_name — Compose needs unique names to run >1 replica.)
+    # Job state lives in Redis, so resolver calls work across replicas.
+    # Traefik load-balances all replicas via the labels below.
+    networks:
+      - web
+    # Pinned resolvers: 8.8.8.8 was dropping 12-40% of this host's UDP DNS
+    # queries (rate limiting — ICMP to it was clean), and every dropped query
+    # cost a 4-5s stall. Because each stream resolves a fresh per-session
+    # rr*---sn-*.googlevideo.com hostname, that hit ~15-40% of stream starts.
+    # Cloudflare measured 0% loss over 120 queries; 8.8.4.4 stays as fallback.
+    # Set here (not just on the host) because Docker's embedded resolver caches
+    # its upstream list at container start.
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.4.4
+    # timeout:1 caps a dropped-query stall at 1s instead of 5s; rotate spreads
+    # queries across the three servers; single-request-reopen avoids the glibc
+    # parallel A/AAAA same-socket race.
+    dns_opt:
+      - timeout:1
+      - attempts:2
+      - rotate
+      - single-request-reopen
+    environment:
+      API_HOST: ${API_HOST:-}
+      BASE_URL: ${BASE_URL:-}
+      START_BOT: "false"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ytube-api.rule=Host(`${API_HOST:-}`)"
+      - "traefik.http.routers.ytube-api.entrypoints=websecure"
+      - "traefik.http.routers.ytube-api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.ytube-api.loadbalancer.server.port=8000"
+    volumes:
+      # Firefox profile mounted so yt-dlp can export YouTube cookies via
+      # --cookies-from-browser. Container runs as root, so /root/.mozilla is the
+      # profile path. SECURITY: use a throwaway account's profile — see README.
+      - ${HOME}/.mozilla/firefox:/root/.mozilla/firefox:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  ytube-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ytube-api:latest
+    container_name: ytube-bot
+    restart: always
+    # The Telegram bot is a single long-poll consumer — never scale this past 1.
+    command: ["python3", "bot.py"]
+    networks:
+      - web
+    # Same resolver pinning as ytube-api — see the rationale above.
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 8.8.4.4
+    dns_opt:
+      - timeout:1
+      - attempts:2
+      - rotate
+      - single-request-reopen
+    depends_on:
+      - ytube-api
+    # Inherits the API image, but long-polls Telegram instead of serving HTTP,
+    # so the image's /health check would always fail here.
+    healthcheck:
+      disable: true
+
+networks:
+  web:
+    external: true
